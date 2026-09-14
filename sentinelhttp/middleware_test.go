@@ -51,9 +51,10 @@ func TestMiddlewareContinuesTraceAndRecordsStatus(t *testing.T) {
 func TestChiMiddlewareUsesRouteTemplate(t *testing.T) {
 	recorder := installRecorder(t)
 	router := chi.NewRouter()
-	router.Get("/users/{id}", ChiHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	router.Use(ChiMiddleware())
+	router.Get("/users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	}), "http.server").ServeHTTP)
+	})
 	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://example.test/users/123", nil))
 
 	spans := recorder.Ended()
@@ -69,4 +70,38 @@ func TestChiMiddlewareUsesRouteTemplate(t *testing.T) {
 		}
 	}
 	t.Fatalf("http.route route template attribute was not recorded: %#v", spans[0].Attributes())
+}
+
+func TestChiMiddlewareUsesNestedRouteTemplatesAndContinuesTrace(t *testing.T) {
+	recorder := installRecorder(t)
+	router := chi.NewRouter()
+	router.Use(ChiMiddleware())
+	router.Get("/orders/{orderID}/items/{itemID}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/orders/abc/items/456", nil)
+	request.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	router.ServeHTTP(httptest.NewRecorder(), request)
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("ended spans = %d, want 1", len(spans))
+	}
+	span := spans[0]
+	if got := span.Name(); got != "GET /orders/{orderID}/items/{itemID}" {
+		t.Fatalf("span name = %q; raw IDs must not be used", got)
+	}
+	if got := span.Parent().SpanID().String(); got != "00f067aa0ba902b7" {
+		t.Fatalf("parent span ID = %s", got)
+	}
+	for _, attr := range span.Attributes() {
+		if string(attr.Key) == "http.route" {
+			if got := attr.Value.AsString(); got != "/orders/{orderID}/items/{itemID}" {
+				t.Fatalf("http.route = %q", got)
+			}
+			return
+		}
+	}
+	t.Fatalf("http.route route template attribute was not recorded: %#v", span.Attributes())
 }

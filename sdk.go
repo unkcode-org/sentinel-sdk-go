@@ -1,5 +1,8 @@
-// Package sentinel configures the official OpenTelemetry Go SDK to export
-// traces and metrics to Sentinel using OTLP/HTTP.
+// Package sentinel bootstraps the official OpenTelemetry Go SDK for Sentinel.
+//
+// It configures standard trace, metric, and log providers to export with
+// OTLP/HTTP. Applications continue to use the normal OpenTelemetry APIs; this
+// package intentionally does not define Sentinel-specific telemetry APIs.
 package sentinel
 
 import (
@@ -10,9 +13,12 @@ import (
 	"sync"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	logglobal "go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -30,14 +36,16 @@ var processState struct {
 type SDK struct {
 	tracerProvider *sdktrace.TracerProvider
 	meterProvider  *sdkmetric.MeterProvider
+	loggerProvider *sdklog.LoggerProvider
 
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
 
-// New validates c, installs OpenTelemetry's global tracer provider, meter
-// provider, and W3C TraceContext+Baggage propagator, and returns their owner.
-// Only one Sentinel SDK can be active in a process at a time.
+// New validates c, creates OpenTelemetry trace, metric, and log providers, and
+// installs them globally with the W3C TraceContext+Baggage propagator. All
+// three providers share the same Resource. Only one Sentinel SDK can be active
+// in a process at a time.
 func New(ctx context.Context, c Config) (*SDK, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -70,9 +78,15 @@ func New(ctx context.Context, c Config) (*SDK, error) {
 		otlpmetrichttp.WithHeaders(headers),
 		otlpmetrichttp.WithTimeout(c.ExportTimeout),
 	}
+	logOpts := []otlploghttp.Option{
+		otlploghttp.WithEndpoint(endpoint.Host),
+		otlploghttp.WithHeaders(headers),
+		otlploghttp.WithTimeout(c.ExportTimeout),
+	}
 	if endpoint.Scheme == "http" {
 		traceOpts = append(traceOpts, otlptracehttp.WithInsecure())
 		metricOpts = append(metricOpts, otlpmetrichttp.WithInsecure())
+		logOpts = append(logOpts, otlploghttp.WithInsecure())
 	}
 
 	traceExporter, err := otlptracehttp.New(ctx, traceOpts...)
@@ -84,6 +98,14 @@ func New(ctx context.Context, c Config) (*SDK, error) {
 		_ = traceExporter.Shutdown(ctx)
 		return nil, fmt.Errorf("sentinel: create metric exporter: %w", err)
 	}
+	logExporter, err := otlploghttp.New(ctx, logOpts...)
+	if err != nil {
+		// Exporters can own HTTP transports. Clean up every successful partial
+		// initialization before returning, while leaving globals untouched.
+		_ = traceExporter.Shutdown(ctx)
+		_ = metricExporter.Shutdown(ctx)
+		return nil, fmt.Errorf("sentinel: create log exporter: %w", err)
+	}
 
 	tracerProvider := sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
@@ -94,10 +116,19 @@ func New(ctx context.Context, c Config) (*SDK, error) {
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(c.MetricInterval))),
 	)
+	loggerProvider := sdklog.NewLoggerProvider(
+		sdklog.WithResource(res),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+	)
 
-	s := &SDK{tracerProvider: tracerProvider, meterProvider: meterProvider}
+	s := &SDK{
+		tracerProvider: tracerProvider,
+		meterProvider:  meterProvider,
+		loggerProvider: loggerProvider,
+	}
 	otel.SetTracerProvider(tracerProvider)
 	otel.SetMeterProvider(meterProvider)
+	logglobal.SetLoggerProvider(loggerProvider)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
@@ -112,24 +143,50 @@ func (s *SDK) TracerProvider() *sdktrace.TracerProvider { return s.tracerProvide
 // MeterProvider returns the installed OpenTelemetry meter provider.
 func (s *SDK) MeterProvider() *sdkmetric.MeterProvider { return s.meterProvider }
 
-// ForceFlush asks OpenTelemetry to immediately export pending spans and metric
-// data. It is useful before a controlled short-lived process exit.
+// LoggerProvider returns the installed OpenTelemetry logger provider.
+func (s *SDK) LoggerProvider() *sdklog.LoggerProvider { return s.loggerProvider }
+
+// ForceFlush asks OpenTelemetry to immediately export pending spans, metrics,
+// and logs. It is useful before a controlled short-lived process exit. A nil
+// context is treated as context.Background.
 func (s *SDK) ForceFlush(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	return errors.Join(s.tracerProvider.ForceFlush(ctx), s.meterProvider.ForceFlush(ctx))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return safeJoin(
+		s.tracerProvider.ForceFlush(ctx),
+		s.meterProvider.ForceFlush(ctx),
+		s.loggerProvider.ForceFlush(ctx),
+	)
 }
 
-// Shutdown flushes and stops both providers. It is safe to call more than once;
-// later calls return the result of the first call. It never resets OpenTelemetry
-// globals, because other instrumentation may still hold their references.
+// Shutdown terminally flushes and stops the trace, metric, and log providers.
+// It is safe to call more than once; later calls return the result of the first
+// call. A nil context is treated as context.Background. It never resets
+// OpenTelemetry globals, because other instrumentation may still hold their
+// references.
+//
+// Applications must not continue serving normal requests after Shutdown. During
+// graceful termination, stop accepting new requests, wait for in-flight work,
+// finish application shutdown work, then call Shutdown before exiting.
 func (s *SDK) Shutdown(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.shutdownOnce.Do(func() {
-		s.shutdownErr = errors.Join(s.tracerProvider.Shutdown(ctx), s.meterProvider.Shutdown(ctx))
+		// Always attempt every provider: a failed exporter must not prevent the
+		// remaining signals from flushing and releasing their resources.
+		s.shutdownErr = safeJoin(
+			s.tracerProvider.Shutdown(ctx),
+			s.meterProvider.Shutdown(ctx),
+			s.loggerProvider.Shutdown(ctx),
+		)
 		processState.Lock()
 		if processState.active == s {
 			processState.active = nil
@@ -137,4 +194,18 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 		processState.Unlock()
 	})
 	return s.shutdownErr
+}
+
+// safeJoin combines lifecycle errors. Exporters are configured with the token
+// only as an HTTP header, and lifecycle errors are never constructed from that
+// header or Config.
+func safeJoin(errs ...error) error {
+	filtered := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		filtered = append(filtered, err)
+	}
+	return errors.Join(filtered...)
 }

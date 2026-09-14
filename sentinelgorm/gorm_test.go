@@ -50,3 +50,33 @@ func TestInstrumentRejectsNilDB(t *testing.T) {
 		t.Fatal("Instrument(nil) error = nil")
 	}
 }
+
+func TestInstrumentPreservesContextTrace(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() { _ = provider.Shutdown(t.Context()) })
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open GORM: %v", err)
+	}
+	if err := Instrument(db); err != nil {
+		t.Fatalf("Instrument() error = %v", err)
+	}
+
+	ctx, parent := otel.Tracer("test/gorm").Start(context.Background(), "request")
+	var value int
+	if err := db.WithContext(ctx).Raw("SELECT 1").Scan(&value).Error; err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	parentContext := parent.SpanContext()
+	parent.End()
+
+	for _, span := range recorder.Ended() {
+		if span.Parent().SpanID() == parentContext.SpanID() {
+			return
+		}
+	}
+	t.Fatalf("no GORM query span recorded: %#v", recorder.Ended())
+}

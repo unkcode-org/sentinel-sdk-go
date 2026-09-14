@@ -76,7 +76,35 @@ func TestConfigErrorDoesNotExposeToken(t *testing.T) {
 	if err == nil {
 		t.Fatal("normalizeConfig() error = nil")
 	}
-	if strings.Contains(err.Error(), c.Token) {
-		t.Fatalf("error exposes token: %v", err)
+	assertNotContainsSecret(t, err, c.Token)
+}
+
+func TestNormalizeConfigAcceptsOTLPBaseEndpoints(t *testing.T) {
+	for _, endpoint := range []struct {
+		endpoint string
+		insecure bool
+	}{
+		{"https://example.test", false},
+		{"https://example.test:8443", false},
+		{"http://127.0.0.1:4318", true},
+		{"https://[2001:db8::1]:4318", false},
+	} {
+		c := validConfig()
+		c.Endpoint = endpoint.endpoint
+		c.Insecure = endpoint.insecure
+		got, err := normalizeConfig(c)
+		if err != nil {
+			t.Fatalf("normalizeConfig(%q) error = %v", endpoint.endpoint, err)
+		}
+		if got.Endpoint != endpoint.endpoint {
+			t.Fatalf("normalized endpoint = %q, want %q", got.Endpoint, endpoint.endpoint)
+		}
+	}
+}
+
+func assertNotContainsSecret(t *testing.T, err error, secret string) {
+	t.Helper()
+	if err != nil && strings.Contains(err.Error(), secret) {
+		t.Fatalf("error exposes secret: %v", err)
 	}
 }

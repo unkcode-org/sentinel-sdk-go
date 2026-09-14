@@ -10,13 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sirupsen/logrus"
+	"github.com/unkcode-org/sentinel-sdk-go/sentinellogrus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	collectorlog "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectormetric "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
+	logv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -171,6 +175,89 @@ func TestSDKSamplingAndPropagation(t *testing.T) {
 	}
 }
 
+func TestSDKExportsLogrusLogsWithTraceCorrelation(t *testing.T) {
+	server, requests := newOTLPReceiver(t)
+	defer server.Close()
+
+	obs, err := New(context.Background(), testSDKConfig(server.URL))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = obs.Shutdown(context.Background()) }()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	logger.SetLevel(logrus.DebugLevel)
+	if err := sentinellogrus.Instrument(logger); err != nil {
+		t.Fatalf("Instrument() error = %v", err)
+	}
+
+	ctx, span := otel.Tracer("test/logs").Start(context.Background(), "checkout")
+	logger.WithContext(ctx).WithFields(logrus.Fields{
+		"order_id":         "order-123",
+		"payment_provider": "mercadopago",
+	}).Error("payment failed")
+	spanContext := span.SpanContext()
+	span.End()
+	logger.Debug("debug message")
+	logger.Info("info message")
+	logger.Warn("warn message")
+
+	if err := obs.ForceFlush(nil); err != nil {
+		t.Fatalf("ForceFlush(nil) error = %v", err)
+	}
+
+	request := waitForRequest(t, requests, "/v1/logs")
+	if request.auth != "Bearer sip_test_token" {
+		t.Fatalf("authorization header = %q", request.auth)
+	}
+	var exported collectorlog.ExportLogsServiceRequest
+	if err := proto.Unmarshal(request.body, &exported); err != nil {
+		t.Fatalf("decode logs: %v", err)
+	}
+	if len(exported.ResourceLogs) == 0 {
+		t.Fatal("no resource logs exported")
+	}
+	if !resourceHasAttributes(exported.ResourceLogs[0].Resource.Attributes, map[string]string{
+		"service.name":                "checkout",
+		"service.version":             "1.2.3",
+		"deployment.environment.name": "test",
+	}) {
+		t.Fatalf("expected service resource attributes, got %#v", exported.ResourceLogs[0].Resource.Attributes)
+	}
+
+	byMessage := logRecords(&exported)
+	for message, severity := range map[string]logv1.SeverityNumber{
+		"debug message":  logv1.SeverityNumber_SEVERITY_NUMBER_DEBUG,
+		"info message":   logv1.SeverityNumber_SEVERITY_NUMBER_INFO,
+		"warn message":   logv1.SeverityNumber_SEVERITY_NUMBER_WARN,
+		"payment failed": logv1.SeverityNumber_SEVERITY_NUMBER_ERROR,
+	} {
+		record := byMessage[message]
+		if record == nil {
+			t.Fatalf("missing log record %q", message)
+		}
+		if record.SeverityNumber != severity {
+			t.Errorf("severity for %q = %v, want %v", message, record.SeverityNumber, severity)
+		}
+	}
+	correlated := byMessage["payment failed"]
+	traceID := spanContext.TraceID()
+	spanID := spanContext.SpanID()
+	if got := string(correlated.TraceId); got != string(traceID[:]) {
+		t.Fatalf("log TraceID = %x, want %s", correlated.TraceId, spanContext.TraceID())
+	}
+	if got := string(correlated.SpanId); got != string(spanID[:]) {
+		t.Fatalf("log SpanID = %x, want %s", correlated.SpanId, spanContext.SpanID())
+	}
+	if !resourceHasAttributes(correlated.Attributes, map[string]string{
+		"order_id":         "order-123",
+		"payment_provider": "mercadopago",
+	}) {
+		t.Fatalf("structured fields missing: %#v", correlated.Attributes)
+	}
+}
+
 func TestSDKShutdownAndDuplicateInitialization(t *testing.T) {
 	server, requests := newOTLPReceiver(t)
 	defer server.Close()
@@ -183,10 +270,12 @@ func TestSDKShutdownAndDuplicateInitialization(t *testing.T) {
 	if _, err := New(context.Background(), testSDKConfig(server.URL)); !errors.Is(err, ErrAlreadyInitialized) {
 		t.Fatalf("second New() error = %v, want ErrAlreadyInitialized", err)
 	}
-	if err := obs.Shutdown(context.Background()); err != nil {
+	_, duplicateErr := New(context.Background(), testSDKConfig(server.URL))
+	assertNotContainsSecret(t, duplicateErr, "sip_test_token")
+	if err := obs.Shutdown(nil); err != nil {
 		t.Fatalf("Shutdown() error = %v", err)
 	}
-	if err := obs.Shutdown(context.Background()); err != nil {
+	if err := obs.Shutdown(nil); err != nil {
 		t.Fatalf("second Shutdown() error = %v", err)
 	}
 	_ = waitForRequest(t, requests, "/v1/traces")
@@ -197,6 +286,96 @@ func TestSDKShutdownAndDuplicateInitialization(t *testing.T) {
 	}
 	if err := second.Shutdown(context.Background()); err != nil {
 		t.Fatalf("second SDK Shutdown() error = %v", err)
+	}
+}
+
+func TestSDKFailedInitializationDoesNotReserveState(t *testing.T) {
+	invalid := validConfig()
+	invalid.Endpoint = "%%%"
+	invalid.Token = "sip_secret_that_must_not_appear"
+	if _, err := New(context.Background(), invalid); err == nil {
+		t.Fatal("New() invalid config error = nil")
+	} else {
+		assertNotContainsSecret(t, err, invalid.Token)
+	}
+
+	server, _ := newOTLPReceiver(t)
+	defer server.Close()
+	obs, err := New(context.Background(), testSDKConfig(server.URL))
+	if err != nil {
+		t.Fatalf("New() after failed initialization error = %v", err)
+	}
+	if err := obs.Shutdown(nil); err != nil {
+		t.Fatalf("Shutdown(nil) error = %v", err)
+	}
+}
+
+func TestSDKConcurrentInitializationAllowsOneActiveInstance(t *testing.T) {
+	server, _ := newOTLPReceiver(t)
+	defer server.Close()
+
+	const attempts = 12
+	start := make(chan struct{})
+	results := make(chan *SDK, attempts)
+	errs := make(chan error, attempts)
+	for range attempts {
+		go func() {
+			<-start
+			sdk, err := New(context.Background(), testSDKConfig(server.URL))
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- sdk
+		}()
+	}
+	close(start)
+
+	var active *SDK
+	for range attempts {
+		select {
+		case sdk := <-results:
+			if active != nil {
+				t.Fatal("more than one New() call succeeded")
+			}
+			active = sdk
+		case err := <-errs:
+			if !errors.Is(err, ErrAlreadyInitialized) {
+				t.Fatalf("concurrent New() error = %v", err)
+			}
+		}
+	}
+	if active == nil {
+		t.Fatal("no concurrent New() call succeeded")
+	}
+	if err := active.Shutdown(nil); err != nil {
+		t.Fatalf("Shutdown(nil) error = %v", err)
+	}
+}
+
+func TestSDKShutdownFlushesPendingLogs(t *testing.T) {
+	server, requests := newOTLPReceiver(t)
+	defer server.Close()
+	obs, err := New(context.Background(), testSDKConfig(server.URL))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	if err := sentinellogrus.Instrument(logger); err != nil {
+		t.Fatalf("Instrument() error = %v", err)
+	}
+	logger.WithField("order_id", "order-456").Error("flush me")
+	if err := obs.Shutdown(nil); err != nil {
+		t.Fatalf("Shutdown(nil) error = %v", err)
+	}
+	request := waitForRequest(t, requests, "/v1/logs")
+	var exported collectorlog.ExportLogsServiceRequest
+	if err := proto.Unmarshal(request.body, &exported); err != nil {
+		t.Fatalf("decode logs: %v", err)
+	}
+	if logRecords(&exported)["flush me"] == nil {
+		t.Fatal("Shutdown did not flush pending log")
 	}
 }
 
@@ -240,4 +419,16 @@ func hasMetric(request *collectormetric.ExportMetricsServiceRequest, name string
 		}
 	}
 	return false
+}
+
+func logRecords(request *collectorlog.ExportLogsServiceRequest) map[string]*logv1.LogRecord {
+	records := make(map[string]*logv1.LogRecord)
+	for _, resourceLogs := range request.ResourceLogs {
+		for _, scopeLogs := range resourceLogs.ScopeLogs {
+			for _, record := range scopeLogs.LogRecords {
+				records[record.Body.GetStringValue()] = record
+			}
+		}
+	}
+	return records
 }
