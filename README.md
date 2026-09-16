@@ -68,7 +68,7 @@ HTTPS is the default and TLS verification is never disabled. HTTP requires both
 an `http://` endpoint and explicit `Insecure: true` (or `SENTINEL_INSECURE=true`).
 Custom ports and IPv6 host:ports are supported.
 
-## Centralized Chi, GORM, and Logrus integration
+## Centralized Chi, GORM, outbound HTTP, and Logrus integration
 
 The production integration is centralized. Do not wrap every endpoint,
 repository, or use case.
@@ -108,6 +108,55 @@ captures SQL bind values. Propagate normal request context:
 ```text
 Handler → UseCase → Repository → db.WithContext(ctx)
 ```
+
+For external HTTP calls, create a client once at startup and pass the incoming
+request context through the adapter or service. `NewClient` wraps the official
+OpenTelemetry `otelhttp` transport: it creates a CLIENT span, propagates W3C
+trace context downstream, and records method, peer/server information, status,
+and errors. CLIENT spans are named `HTTP <METHOD>` so paths, IDs, and query
+values never affect span names. The integration does not capture request or
+response bodies, headers, cookies, URL paths, query values, or credentials.
+
+```go
+type MapsAdapter struct {
+	client *http.Client
+}
+
+// After sentinel.New at startup: one shared client for all outbound adapters.
+mapsAdapter := &MapsAdapter{client: sentinelhttp.NewClient(nil)}
+
+func (a *MapsAdapter) Geocode(ctx context.Context, place string) error {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		"https://maps.example/geocode?address="+url.QueryEscape(place),
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	response, err := a.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	return nil
+}
+
+// Incoming HTTP request context -> adapter/service -> outbound request context
+// produces a child HTTP CLIENT span automatically.
+func getOrder(adapter *MapsAdapter) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_ = adapter.Geocode(r.Context(), "customer supplied address")
+	}
+}
+```
+
+Use `sentinelhttp.NewTransport(http.DefaultTransport)` when a library or
+existing `http.Client` needs only a `RoundTripper`. If the supplied transport
+is already the official OpenTelemetry `otelhttp.Transport`, Sentinel returns it
+unchanged to avoid redundant nested CLIENT spans.
 
 ## Logs and trace/log correlation
 

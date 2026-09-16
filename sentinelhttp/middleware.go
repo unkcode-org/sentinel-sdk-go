@@ -1,5 +1,5 @@
-// Package sentinelhttp provides thin net/http and Chi integration over the
-// official OpenTelemetry otelhttp instrumentation.
+// Package sentinelhttp provides thin net/http, HTTP client, and Chi
+// integrations over the official OpenTelemetry otelhttp instrumentation.
 package sentinelhttp
 
 import (
