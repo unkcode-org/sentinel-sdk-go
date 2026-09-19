@@ -68,12 +68,19 @@ HTTPS is the default and TLS verification is never disabled. HTTP requires both
 an `http://` endpoint and explicit `Insecure: true` (or `SENTINEL_INSECURE=true`).
 Custom ports and IPv6 host:ports are supported.
 
-## Centralized Chi, GORM, outbound HTTP, and Logrus integration
+## Full backend setup
 
-The production integration is centralized. Do not wrap every endpoint,
-repository, or use case.
+The production integration is centralized: bootstrap Sentinel once, instrument
+infrastructure once, and pass normal `context.Context` values through the
+application. Consumer projects do not configure `otelhttp`, `otelgrpc`,
+Redis OTel plugins, GORM OTel plugins, or OTLP exporters directly.
 
 ```go
+telemetry, err := sentinel.NewFromEnv(ctx)
+if err != nil {
+	return err
+}
+
 logger := logrus.New()
 if err := sentinellogrus.Instrument(logger); err != nil {
 	return err
@@ -83,13 +90,20 @@ db, err := gorm.Open(...)
 if err != nil {
 	return err
 }
-if err := sentinelgorm.Instrument(db); err != nil {
+	if err := sentinelgorm.Instrument(db); err != nil {
+	return err
+}
+
+redisClient := redis.NewClient(&redis.Options{Addr: "redis:6379"})
+if err := sentinelredis.Instrument(redisClient); err != nil {
 	return err
 }
 
 router := chi.NewRouter()
 router.Use(sentinelhttp.ChiMiddleware())
 router.Get("/orders/{orderID}", getOrder)
+
+externalHTTP := sentinelhttp.NewClient(nil)
 ```
 
 `ChiMiddleware` is the recommended Chi API. It resolves the Chi route template
@@ -108,6 +122,16 @@ captures SQL bind values. Propagate normal request context:
 ```text
 Handler → UseCase → Repository → db.WithContext(ctx)
 ```
+
+`sentinelredis.Instrument` installs the maintained go-redis `redisotel`
+tracing and metrics hooks. Call it once for each `*redis.Client`, cluster, or
+ring client. Redis operation spans use the context supplied to calls such as
+`redisClient.Get(ctx, key)`. Sentinel disables upstream raw command statements
+and caller locations, so keys and values are not attached to spans. Its pool
+metrics use bounded connection-pool attributes. Calling Sentinel's function
+again with the same client is idempotent; do not also install `redisotel`
+directly on that client, because go-redis does not expose installed hooks for
+cross-package duplicate detection.
 
 For external HTTP calls, create a client once at startup and pass the incoming
 request context through the adapter or service. `NewClient` wraps the official
@@ -157,6 +181,57 @@ Use `sentinelhttp.NewTransport(http.DefaultTransport)` when a library or
 existing `http.Client` needs only a `RoundTripper`. If the supplied transport
 is already the official OpenTelemetry `otelhttp.Transport`, Sentinel returns it
 unchanged to avoid redundant nested CLIENT spans.
+
+### gRPC clients and servers
+
+For outbound gRPC, `sentinelgrpc.NewClient` is a small convenience around the
+modern lazy `grpc.NewClient`: it adds the official OTel stats handler and passes
+every supplied gRPC option through unchanged.
+
+```go
+conn, err := sentinelgrpc.NewClient(
+	"orders.internal:443",
+	grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+)
+if err != nil {
+	return err
+}
+defer conn.Close()
+
+ordersClient := ordersv1.NewOrdersClient(conn)
+// The ctx passed to ordersClient methods is propagated automatically.
+```
+
+For composition with an existing gRPC connection factory, use
+`sentinelgrpc.ClientOption()` directly:
+
+```go
+conn, err := grpc.NewClient(
+	"orders.internal:443",
+	sentinelgrpc.ClientOption(),
+	grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+)
+```
+
+For every inbound gRPC server, add one composable server option:
+
+```go
+grpcServer := grpc.NewServer(
+	sentinelgrpc.ServerOption(),
+)
+ordersv1.RegisterOrdersServer(grpcServer, ordersServer)
+```
+
+These handlers use Sentinel's global TraceContext+Baggage propagator to create
+client and server RPC spans, preserving distributed parentage. The maintained
+OTel handler records the full RPC service/method, status, errors, duration, and
+standard supported RPC metrics. Sentinel does not enable message events and
+does not capture protobuf request or response bodies, gRPC metadata,
+`Authorization` values, tokens, or certificates.
+
+After this setup, add manual telemetry only where a business operation adds
+meaningful visibility; use standard `otel.Tracer(...)` and `otel.Meter(...)`
+there as usual.
 
 ## Logs and trace/log correlation
 
@@ -238,7 +313,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := sentinelgorm.Instrument(db); err != nil {
+if err := sentinelgorm.Instrument(db); err != nil {
+		log.Fatal(err)
+	}
+	redisClient := redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	if err := sentinelredis.Instrument(redisClient); err != nil {
 		log.Fatal(err)
 	}
 
@@ -258,7 +337,8 @@ func main() {
   `deployment.environment.name`, never Sentinel tenant/application/environment
   identity attributes.
 - The SDK never automatically collects HTTP bodies, headers, cookies,
-  environment variables, credentials, or GORM bind values.
+  environment variables, credentials, GORM bind values, Redis command
+  statements/keys/values, gRPC protobuf bodies, or gRPC metadata.
 - Only fields explicitly supplied to Logrus are translated. Do not log
   credentials, body contents, or other sensitive data; v0.1 does not apply
   generic redaction.
