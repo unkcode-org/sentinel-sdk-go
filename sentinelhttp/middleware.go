@@ -22,10 +22,11 @@ func Middleware(serviceOperation string, opts ...Option) func(http.Handler) http
 }
 
 // ChiMiddleware is the recommended centralized Chi integration. Register it
-// once with r.Use(sentinelhttp.ChiMiddleware()). Chi resolves Request.Pattern
-// before the routed handler returns, which lets official otelhttp record the
-// route template in the span name and http.route attribute rather than a raw
-// parameterized path.
+// once with r.Use(sentinelhttp.ChiMiddleware()). It resolves Chi's matched
+// route template before otelhttp starts the span so official otelhttp can
+// record http.route. After Chi dispatches the route, otelhttp formats the span
+// name again using Chi's authoritative Request.Pattern. Route templates—not
+// concrete parameter values—are used throughout.
 //
 // It does not collect request or response bodies, headers, cookies, or query
 // values. Those are not enabled by any option in this package.
@@ -33,14 +34,15 @@ func ChiMiddleware(opts ...Option) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		instrumented := otelhttp.NewMiddleware("http.server", withSafeSpanNaming("http.server", opts)...)(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Chi middleware runs before the router dispatches the endpoint, so
-			// resolve its route into a separate context first. This is the one
-			// Chi-specific step; otelhttp then owns all HTTP attributes, status
-			// handling, propagation, metrics, and span lifecycle.
+			// Chi middleware runs before the router dispatches the endpoint. Use
+			// Find's resolved template from an isolated context so otelhttp can
+			// add http.route when the span starts. Do not read the scratch
+			// context's evolving RoutePattern: Chi documents that it is only
+			// authoritative after downstream dispatch returns.
 			if routeContext := chi.RouteContext(r.Context()); routeContext != nil && routeContext.Routes != nil {
 				matched := chi.NewRouteContext()
-				if routeContext.Routes.Match(matched, r.Method, r.URL.Path) {
-					r.Pattern = matched.RoutePattern()
+				if pattern := routeContext.Routes.Find(matched, r.Method, r.URL.Path); pattern != "" {
+					r.Pattern = pattern
 				}
 			}
 			instrumented.ServeHTTP(w, r)
